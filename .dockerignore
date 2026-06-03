@@ -1,0 +1,12 @@
+.git
+.brv
+node_modules
+npm-debug.log*
+.env
+.env.*
+*.log
+coverage
+test-results
+playwright-report
+data
+.camoufox

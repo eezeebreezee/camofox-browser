@@ -35,6 +35,7 @@ This project wraps that engine in a REST API built for agents: accessibility sna
 - **Runs on Anything** - lazy browser launch + idle shutdown keeps memory at ~40MB when idle. Designed to share a box with the rest of your stack — Raspberry Pi, $5 VPS, shared Railway infra.
 - **Session Isolation** - separate cookies/storage per user
 - **Cookie Import** - inject Netscape-format cookie files for authenticated browsing
+- **Disk-Backed Storage State** - persist cookies and localStorage per user across server/container restarts
 - **Proxy + GeoIP** - route traffic through residential proxies with automatic locale/timezone
 - **Structured Logging** - JSON log lines with request IDs for production observability
 - **YouTube Transcripts** - extract captions from any YouTube video via yt-dlp, no API key needed
@@ -78,7 +79,20 @@ Default port is `9377`. See [Environment Variables](#environment-variables) for 
 
 ```bash
 docker build -t camofox-browser .
-docker run -p 9377:9377 camofox-browser
+docker run -p 127.0.0.1:9377:3000 \
+  -v camofox-cookies:/root/.camofox/cookies \
+  camofox-browser
+```
+
+The Docker image can also expose VNC/noVNC for manual login flows. Bind those
+ports to loopback, a VPN address, or another trusted private interface only;
+browser-control access is equivalent to access to any logged-in browser session.
+
+```bash
+docker run -p 127.0.0.1:9377:3000 \
+  -p 127.0.0.1:6080:6080 \
+  -v camofox-cookies:/root/.camofox/cookies \
+  camofox-browser
 ```
 
 ### Fly.io / Railway
@@ -155,6 +169,21 @@ Camoufox browser session                 (authenticated browsing)
 - Max 500 cookies per request, 5MB file size limit
 - Cookie objects are sanitized to an allowlist of Playwright fields
 
+#### Persistent browser state
+
+Camofox persists Playwright `storageState` snapshots per normalized `userId`.
+Those snapshots include browser cookies plus localStorage/sessionStorage and are
+stored under `${CAMOFOX_COOKIES_DIR}/storage-state/` using hashed filenames.
+
+- The default path is `~/.camofox/cookies/storage-state/`.
+- Storage-state JSON files are written atomically with `0600` permissions where supported.
+- State is saved periodically and on lifecycle events such as cookie import, tab/session close, browser restart, and graceful shutdown.
+- `DELETE /sessions/:userId` closes the live browser context after saving its state; it does **not** delete persisted storage state.
+
+Treat this directory like a credential store. If you use the VNC/noVNC image for
+manual login, keep API, VNC, and noVNC ports private or behind a trusted access
+layer.
+
 #### Standalone server usage
 
 ```bash
@@ -167,9 +196,9 @@ curl -X POST http://localhost:9377/sessions/agent1/cookies \
 #### Docker / Fly.io
 
 ```bash
-docker run -p 9377:9377 \
+docker run -p 127.0.0.1:9377:3000 \
   -e CAMOFOX_API_KEY="your-generated-key" \
-  -v ~/.camofox/cookies:/home/node/.camofox/cookies:ro \
+  -v ~/.camofox/cookies:/root/.camofox/cookies:rw \
   camofox-browser
 ```
 
@@ -325,6 +354,7 @@ Reddit macros return JSON directly (no HTML parsing needed):
 | `CAMOFOX_API_KEY` | Enable cookie import endpoint (disabled if unset) | - |
 | `CAMOFOX_ADMIN_KEY` | Required for `POST /stop` | - |
 | `CAMOFOX_COOKIES_DIR` | Directory for cookie files | `~/.camofox/cookies` |
+| `CAMOFOX_STORAGE_STATE_SAVE_INTERVAL_MS` | Periodic storage-state save interval | `30000` |
 | `MAX_SESSIONS` | Max concurrent browser sessions | `50` |
 | `MAX_TABS_PER_SESSION` | Max tabs per session | `10` |
 | `SESSION_TIMEOUT_MS` | Session inactivity timeout | `1800000` (30min) |

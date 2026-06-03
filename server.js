@@ -3,6 +3,8 @@ import { firefox } from 'playwright-core';
 import express from 'express';
 import crypto from 'crypto';
 import os from 'os';
+import fs from 'fs/promises';
+import path from 'path';
 import { expandMacro } from './lib/macros.js';
 import { loadConfig } from './lib/config.js';
 import { normalizePlaywrightProxy } from './lib/proxy.js';
@@ -20,7 +22,7 @@ import {
   register as metricsRegister,
   requestsTotal, requestDuration, pageLoadDuration,
   activeTabsGauge, tabLockQueueDepth,
-  tabLockTimeoutsTotal, startMemoryReporter, actionFromReq,
+  tabLockTimeoutsTotal, startMemoryReporter, stopMemoryReporter, actionFromReq,
 } from './lib/metrics.js';
 
 const CONFIG = loadConfig();
@@ -220,6 +222,7 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
 
     const session = await getSession(userId);
     await session.context.addCookies(sanitized);
+    await saveSessionStorageState(userId, session, 'cookie-import');
     const result = { ok: true, userId: String(userId), count: sanitized.length };
     log('info', 'cookies imported', { reqId: req.reqId, userId: String(userId), count: sanitized.length });
     res.json(result);
@@ -446,7 +449,8 @@ async function restartBrowser(reason) {
   healthState.isRecovering = true;
   log('error', 'restarting browser', { reason, failures: healthState.consecutiveNavFailures });
   try {
-    for (const [, session] of sessions) {
+    for (const [userId, session] of sessions) {
+      await saveSessionStorageState(userId, session, 'browser-restart');
       await session.context.close().catch(() => {});
     }
     sessions.clear();
@@ -476,17 +480,59 @@ function getTotalTabCount() {
   return total;
 }
 
+async function makePageVisible(page) {
+  if (CONFIG.headless) return;
+  try {
+    await page.bringToFront();
+  } catch (err) {
+    log('debug', 'page bringToFront failed', { error: err.message });
+  }
+}
+
+async function createVisiblePage(context) {
+  const page = await context.newPage();
+  await makePageVisible(page);
+  return page;
+}
+
+async function gotoVisiblePage(page, url, options) {
+  const result = await page.goto(url, options);
+  await makePageVisible(page);
+  return result;
+}
+
 async function launchBrowserInstance() {
   const hostOS = getHostOS();
   const proxy = buildProxyConfig();
   
   log('info', 'launching camoufox', { hostOS, geoip: !!proxy });
   
+  const visibleLaunchOptions = CONFIG.headless ? {} : {
+    screen: { maxWidth: CONFIG.windowWidth, maxHeight: CONFIG.windowHeight },
+    window: [CONFIG.windowWidth, CONFIG.windowHeight],
+    // Xvfb/VNC can show black browser contents when Firefox/Camoufox uses GPU/WebRender paths.
+    // Force software rendering for the headful VNC profile while keeping normal automation behavior.
+    firefox_user_prefs: {
+      'layers.acceleration.disabled': true,
+      'gfx.webrender.force-disabled': true,
+      'gfx.webrender.all': false,
+      'media.hardware-video-decoding.enabled': false,
+    },
+    env: {
+      MOZ_WEBRENDER: '0',
+      MOZ_ACCELERATED: '0',
+      MOZ_X11_EGL: '0',
+      MOZ_DISABLE_RDD_SANDBOX: '1',
+      LIBGL_ALWAYS_SOFTWARE: '1',
+    },
+  };
+
   const options = await launchOptions({
-    headless: true,
+    headless: CONFIG.headless,
     os: hostOS,
     humanize: true,
     enable_cache: true,
+    ...visibleLaunchOptions,
     proxy: proxy,
     geoip: !!proxy,
   });
@@ -504,6 +550,7 @@ async function ensureBrowser() {
       deadSessions: sessions.size,
     });
     for (const [userId, session] of sessions) {
+      await saveSessionStorageState(userId, session, 'browser-disconnect');
       await session.context.close().catch(() => {});
     }
     sessions.clear();
@@ -523,6 +570,85 @@ function normalizeUserId(userId) {
   return String(userId);
 }
 
+const STORAGE_STATE_DIR = path.join(CONFIG.cookiesDir, 'storage-state');
+const STORAGE_STATE_SAVE_INTERVAL_MS = CONFIG.storageStateSaveIntervalMs;
+
+function storageStatePathForUserId(userId) {
+  const key = normalizeUserId(userId);
+  const digest = crypto.createHash('sha256').update(key).digest('hex');
+  return path.join(STORAGE_STATE_DIR, `${digest}.json`);
+}
+
+async function loadStorageStateForUser(userId) {
+  const filePath = storageStatePathForUserId(userId);
+  try {
+    const raw = await fs.readFile(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.cookies) || !Array.isArray(parsed.origins)) {
+      throw new Error('invalid storageState shape');
+    }
+    log('info', 'storage state loaded', {
+      userId: normalizeUserId(userId),
+      cookies: parsed.cookies.length,
+      origins: parsed.origins.length,
+    });
+    return parsed;
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    log('warn', 'storage state ignored', { userId: normalizeUserId(userId), error: err.message });
+    return null;
+  }
+}
+
+async function atomicWriteJson(filePath, data) {
+  await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const tmpPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(tmpPath, JSON.stringify(data), { mode: 0o600 });
+  await fs.rename(tmpPath, filePath);
+  await fs.chmod(filePath, 0o600).catch(() => {});
+}
+
+async function saveSessionStorageState(userId, session, reason = 'periodic') {
+  if (!session?.context || session.storageStateSaving) return false;
+  const key = normalizeUserId(userId);
+  session.storageStateSaving = true;
+  try {
+    const state = await session.context.storageState();
+    const digest = crypto.createHash('sha256').update(JSON.stringify(state)).digest('hex');
+    if (session.storageStateDigest === digest) return false;
+    await atomicWriteJson(storageStatePathForUserId(key), state);
+    session.storageStateDigest = digest;
+    session.lastStorageStateSaved = Date.now();
+    log('info', 'storage state saved', {
+      userId: key,
+      reason,
+      cookies: state.cookies?.length || 0,
+      origins: state.origins?.length || 0,
+    });
+    return true;
+  } catch (err) {
+    log('warn', 'storage state save failed', { userId: key, reason, error: err.message });
+    return false;
+  } finally {
+    session.storageStateSaving = false;
+  }
+}
+
+async function saveAllStorageStates(reason = 'periodic') {
+  const tasks = [];
+  for (const [userId, session] of sessions) {
+    tasks.push(saveSessionStorageState(userId, session, reason));
+  }
+  await Promise.allSettled(tasks);
+}
+
+const storageStateSaveTimer = setInterval(() => {
+  saveAllStorageStates('periodic').catch((err) => {
+    log('warn', 'storage state periodic save failed', { error: err.message });
+  });
+}, STORAGE_STATE_SAVE_INTERVAL_MS);
+storageStateSaveTimer.unref?.();
+
 async function getSession(userId) {
   const key = normalizeUserId(userId);
   let session = sessions.get(key);
@@ -534,6 +660,7 @@ async function getSession(userId) {
       session.context.pages();
     } catch (err) {
       log('warn', 'session context dead, recreating', { userId: key, error: err.message });
+      await saveSessionStorageState(key, session, 'dead-context').catch(() => {});
       session.context.close().catch(() => {});
       sessions.delete(key);
       session = null;
@@ -546,7 +673,7 @@ async function getSession(userId) {
     }
     const b = await ensureBrowser();
     const contextOptions = {
-      viewport: { width: 1280, height: 720 },
+      viewport: { width: CONFIG.viewportWidth, height: CONFIG.viewportHeight },
       permissions: ['geolocation'],
     };
     // When geoip is active (proxy configured), camoufox auto-configures
@@ -556,6 +683,8 @@ async function getSession(userId) {
       contextOptions.timezoneId = 'America/Los_Angeles';
       contextOptions.geolocation = { latitude: 37.7749, longitude: -122.4194 };
     }
+    const storageState = await loadStorageStateForUser(key);
+    if (storageState) contextOptions.storageState = storageState;
     const context = await b.newContext(contextOptions);
     
     session = { context, tabGroups: new Map(), lastAccess: Date.now() };
@@ -602,7 +731,9 @@ function isTabDestroyedError(err) {
 function handleRouteError(err, req, res, extraFields = {}) {
   const userId = req.body?.userId || req.query?.userId;
   if (userId && isDeadContextError(err)) {
-    destroySession(userId);
+    destroySession(userId).catch((destroyErr) => {
+      log('warn', 'destroy session failed', { userId: normalizeUserId(userId), error: destroyErr.message });
+    });
   }
   // Track consecutive timeouts per tab and auto-destroy stuck tabs
   if (userId && isTimeoutError(err)) {
@@ -656,11 +787,12 @@ function destroyTab(session, tabId) {
   return false;
 }
 
-function destroySession(userId) {
+async function destroySession(userId) {
   const key = normalizeUserId(userId);
   const session = sessions.get(key);
   if (!session) return;
   log('warn', 'destroying dead session', { userId: key });
+  await saveSessionStorageState(key, session, 'destroy-session');
   session.context.close().catch(() => {});
   sessions.delete(key);
 }
@@ -1129,7 +1261,7 @@ async function browserTranscript(reqId, url, videoId, lang) {
   return await withUserLimit('__yt_transcript__', async () => {
     await ensureBrowser();
     const session = await getSession('__yt_transcript__');
-    const page = await session.context.newPage();
+    const page = await createVisiblePage(session.context);
 
     try {
       await page.addInitScript(() => {
@@ -1148,7 +1280,7 @@ async function browserTranscript(reqId, url, videoId, lang) {
         }
       });
 
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS });
+      await gotoVisiblePage(page, url, { waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS });
       await page.waitForTimeout(2000);
 
       // Extract caption track URLs and metadata from ytInitialPlayerResponse
@@ -1253,6 +1385,10 @@ app.get('/health', (req, res) => {
     browserRunning: running,
     activeTabs: getTotalTabCount(),
     consecutiveFailures: healthState.consecutiveNavFailures,
+    headless: CONFIG.headless,
+    vncPort: CONFIG.vncPort || undefined,
+    noVncPort: CONFIG.noVncPort || undefined,
+    viewport: { width: CONFIG.viewportWidth, height: CONFIG.viewportHeight },
   });
 });
 
@@ -1286,7 +1422,7 @@ app.post('/tabs', async (req, res) => {
       
       const group = getTabGroup(session, resolvedSessionKey);
       
-      const page = await session.context.newPage();
+      const page = await createVisiblePage(session.context);
       const tabId = crypto.randomUUID();
       const tabState = createTabState(page);
       attachDownloadListener(tabState, tabId);
@@ -1296,7 +1432,7 @@ app.post('/tabs', async (req, res) => {
       if (url) {
         const urlErr = validateUrl(url);
         if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
-        await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+        await withPageLoadDuration('open_url', () => gotoVisiblePage(page, url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
         tabState.visitedUrls.add(url);
       }
       
@@ -1355,7 +1491,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
             throw new Error('Maximum tabs per session reached');
           }
         } else {
-          const page = await session.context.newPage();
+          const page = await createVisiblePage(session.context);
           tabState = createTabState(page);
           attachDownloadListener(tabState, tabId, log);
           const group = getTabGroup(session, resolvedSessionKey);
@@ -1379,7 +1515,7 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       if (urlErr) throw new Error(urlErr);
       
       return await withTabLock(tabId, async () => {
-        await withPageLoadDuration('navigate', () => tabState.page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+        await withPageLoadDuration('navigate', () => gotoVisiblePage(tabState.page, targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }));
         tabState.visitedUrls.add(targetUrl);
         tabState.lastSnapshot = null;
         
@@ -2079,6 +2215,7 @@ app.delete('/tabs/:tabId', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, req.params.tabId);
     if (found) {
+      await saveSessionStorageState(userId, session, 'tab-close');
       await clearTabDownloads(found.tabState);
       await safePageClose(found.tabState.page);
       found.group.delete(req.params.tabId);
@@ -2103,6 +2240,7 @@ app.delete('/tabs/group/:listItemId', async (req, res) => {
     const session = sessions.get(normalizeUserId(userId));
     const group = session?.tabGroups.get(req.params.listItemId);
     if (group) {
+      await saveSessionStorageState(userId, session, 'tab-group-close');
       for (const [tabId, tabState] of group) {
         await clearTabDownloads(tabState);
         await safePageClose(tabState.page);
@@ -2130,6 +2268,7 @@ app.delete('/sessions/:userId', async (req, res) => {
     const userId = normalizeUserId(req.params.userId);
     const session = sessions.get(userId);
     if (session) {
+      await saveSessionStorageState(userId, session, 'session-close');
       await clearSessionDownloads(session);
       await session.context.close();
       sessions.delete(userId);
@@ -2156,10 +2295,11 @@ app.delete('/sessions/:userId', async (req, res) => {
 });
 
 // Cleanup stale sessions
-setInterval(() => {
+setInterval(async () => {
   const now = Date.now();
   for (const [userId, session] of sessions) {
     if (now - session.lastAccess > SESSION_TIMEOUT_MS) {
+      await saveSessionStorageState(userId, session, 'session-expired');
       clearSessionDownloads(session).catch(() => {});
       session.context.close().catch(() => {});
       sessions.delete(userId);
@@ -2284,14 +2424,14 @@ app.post('/tabs/open', async (req, res) => {
     
     const group = getTabGroup(session, listItemId);
     
-    const page = await session.context.newPage();
+    const page = await createVisiblePage(session.context);
     const tabId = crypto.randomUUID();
     const tabState = createTabState(page);
     attachDownloadListener(tabState, tabId, log);
     group.set(tabId, tabState);
     refreshActiveTabsGauge();
     
-    await withPageLoadDuration('open_url', () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+    await withPageLoadDuration('open_url', () => gotoVisiblePage(page, url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
     tabState.visitedUrls.add(url);
     
     log('info', 'openclaw tab opened', { reqId: req.reqId, tabId, url: page.url() });
@@ -2325,6 +2465,7 @@ app.post('/stop', async (req, res) => {
     if (!adminKey || !timingSafeCompare(adminKey, CONFIG.adminKey)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
+    await saveAllStorageStates('stop-endpoint');
     if (browser) {
       await browser.close().catch(() => {});
       browser = null;
@@ -2379,7 +2520,7 @@ app.post('/navigate', async (req, res) => {
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0;
     
     const result = await withTabLock(targetId, async () => {
-      await withPageLoadDuration('navigate', () => tabState.page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
+      await withPageLoadDuration('navigate', () => gotoVisiblePage(tabState.page, url, { waitUntil: 'domcontentloaded', timeout: 30000 }));
       tabState.visitedUrls.add(url);
       tabState.lastSnapshot = null;
       
@@ -2748,6 +2889,8 @@ async function gracefulShutdown(signal) {
 
   server.close();
   stopMemoryReporter();
+
+  await saveAllStorageStates('shutdown');
 
   for (const [userId, session] of sessions) {
     await session.context.close().catch(() => {});

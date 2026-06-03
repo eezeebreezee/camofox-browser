@@ -31,6 +31,13 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
     unzip \
+    build-essential \
+    xvfb \
+    x11vnc \
+    novnc \
+    websockify \
+    openbox \
+    xdotool \
     # yt-dlp runtime dependency
     python3-minimal \
     && rm -rf /var/lib/apt/lists/*
@@ -57,10 +64,18 @@ RUN npm install --production
 
 COPY server.js ./
 COPY lib/ ./lib/
+COPY start-vnc.sh ./start-vnc.sh
+RUN chmod +x ./start-vnc.sh
 
 ENV NODE_ENV=production
 ENV CAMOFOX_PORT=3000
+ENV CAMOFOX_HEADLESS=false
+ENV CAMOFOX_VNC_PORT=5900
+ENV CAMOFOX_NOVNC_PORT=6080
+ENV CAMOFOX_VIEWPORT_WIDTH=1100
+ENV CAMOFOX_VIEWPORT_HEIGHT=700
+ENV XVFB_SCREEN=1440x900x24
 
-EXPOSE 3000
+EXPOSE 3000 5900 6080
 
-CMD ["sh", "-c", "node --max-old-space-size=${MAX_OLD_SPACE_SIZE:-128} server.js"]
+CMD ["./start-vnc.sh"]
