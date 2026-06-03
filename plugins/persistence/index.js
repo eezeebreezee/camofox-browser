@@ -18,7 +18,7 @@
  *   CAMOFOX_PROFILE_DIR=/data/profiles
  *
  * Each userId gets a deterministic SHA256-hashed subdirectory under profileDir.
- * Storage state is checkpointed on cookie import, session close, and shutdown.
+ * Storage state is checkpointed periodically and on cookie import, session close, and shutdown.
  * On session creation, saved state is restored into the new Playwright context
  * via the session:creating hook (mutates contextOptions.storageState).
  */
@@ -40,13 +40,25 @@ export async function register(app, ctx, pluginConfig = {}) {
     return;
   }
 
+  const rawSaveIntervalMs = (
+    process.env.CAMOFOX_STORAGE_STATE_SAVE_INTERVAL_MS ??
+    pluginConfig.saveIntervalMs ??
+    pluginConfig.storageStateSaveIntervalMs ??
+    config.storageStateSaveIntervalMs ??
+    30000
+  );
+  const parsedSaveIntervalMs = parseInt(rawSaveIntervalMs, 10);
+  const saveIntervalMs = Number.isFinite(parsedSaveIntervalMs) && parsedSaveIntervalMs > 0
+    ? parsedSaveIntervalMs
+    : 30000;
+
   const logger = {
     warn: (msg, fields = {}) => log('warn', msg, fields),
   };
 
-  log('info', 'persistence plugin enabled', { profileDir });
+  log('info', 'persistence plugin enabled', { profileDir, saveIntervalMs });
 
-  // Track active sessions for checkpoint on close
+  // Track active sessions for checkpoint on close and periodic save.
   const activeSessions = new Map(); // userId -> context
 
   /**
@@ -60,6 +72,13 @@ export async function register(app, ctx, pluginConfig = {}) {
     }
     return result;
   }
+
+  const checkpointTimer = setInterval(() => {
+    for (const [userId, context] of activeSessions) {
+      checkpoint(userId, context, 'periodic').catch(() => {});
+    }
+  }, saveIntervalMs);
+  checkpointTimer.unref?.();
 
   // --- Lifecycle hooks ---
 
@@ -116,6 +135,7 @@ export async function register(app, ctx, pluginConfig = {}) {
 
   // On shutdown: checkpoint all remaining sessions
   events.on('server:shutdown', async () => {
+    clearInterval(checkpointTimer);
     for (const [userId, context] of activeSessions) {
       await checkpoint(userId, context, 'shutdown').catch(() => {});
     }

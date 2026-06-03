@@ -54,20 +54,25 @@ async function startServer(port = 0, extraEnv = {}) {
 
 async function stopServer() {
   if (serverProcess) {
+    const proc = serverProcess;
+
     return new Promise((resolve) => {
-      serverProcess.on('close', () => {
-        serverProcess = null;
-        serverPort = null;
+      const killTimer = setTimeout(() => {
+        if (serverProcess === proc) {
+          proc.kill('SIGKILL');
+        }
+      }, 5000);
+
+      proc.once('close', () => {
+        clearTimeout(killTimer);
+        if (serverProcess === proc) {
+          serverProcess = null;
+          serverPort = null;
+        }
         resolve();
       });
 
-      serverProcess.kill('SIGTERM');
-
-      setTimeout(() => {
-        if (serverProcess) {
-          serverProcess.kill('SIGKILL');
-        }
-      }, 5000);
+      proc.kill('SIGTERM');
     });
   }
 }

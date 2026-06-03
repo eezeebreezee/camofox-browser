@@ -44,6 +44,7 @@ This project wraps that engine in a REST API built for agents: accessibility sna
 - **Token-Efficient** - accessibility snapshots are ~90% smaller than raw HTML
 - **Runs on Anything** - lazy browser launch + idle shutdown keeps memory at ~40MB when idle. Designed to share a box with the rest of your stack -- Raspberry Pi, $5 VPS, shared infra.
 - **Session Isolation** - separate cookies/storage per user
+- **Session Persistence** - disk-backed cookies/localStorage checkpoints survive server/container restarts
 - **Cookie Import** - inject Netscape-format cookie files for authenticated browsing
 - **Proxy + GeoIP** - route traffic through residential proxies with automatic locale/timezone
 - **Structured Logging** - JSON log lines with request IDs for production observability
@@ -261,7 +262,7 @@ By default, camofox persists each user's cookies and localStorage to `~/.camofox
         \-- storage_state.json
 ```
 
-Override the directory with `CAMOFOX_PROFILE_DIR` or set `"profileDir"` in the persistence plugin config. To disable persistence, set `"persistence": { "enabled": false }` in `camofox.config.json`.
+Override the directory with `CAMOFOX_PROFILE_DIR` or set `"profileDir"` in the persistence plugin config. The server checkpoints active sessions every 30 seconds by default, plus on cookie import, session close, and graceful shutdown; tune the interval with `CAMOFOX_STORAGE_STATE_SAVE_INTERVAL_MS`. To disable persistence, set `"persistence": { "enabled": false }` in `camofox.config.json`.
 
 ### Session Tracing
 
@@ -617,6 +618,7 @@ Reddit macros return JSON directly (no HTML parsing needed):
 | `CAMOFOX_EXECUTABLE_PATH` | Compatibility alias for `CAMOUFOX_EXECUTABLE` | - |
 | `CAMOFOX_COOKIES_DIR` | Directory for cookie files | `~/.camofox/cookies` |
 | `CAMOFOX_PROFILE_DIR` | Directory for persisted session profiles | `~/.camofox/profiles` |
+| `CAMOFOX_STORAGE_STATE_SAVE_INTERVAL_MS` | Periodic storage-state checkpoint interval | `30000` |
 | `CAMOFOX_TRACES_DIR` | Directory for session trace zips | `~/.camofox/traces` |
 | `CAMOFOX_TRACES_MAX_BYTES` | Max size per trace, removed on next startup if exceeded | `52428800` (50MB) |
 | `CAMOFOX_TRACES_TTL_HOURS` | Traces older than this are swept on startup | `24` |
@@ -692,7 +694,7 @@ Anonymized crash/hang telemetry is sent to a Cloudflare Worker endpoint. The end
 
 ### Session persistence
 
-The persistence plugin saves cookies and localStorage to `~/.camofox/profiles/<hashed-userId>/` so authenticated sessions survive browser restarts. UserIds are hashed for directory names. Disable via `camofox.config.json` by removing `persistence` from the plugins array.
+The persistence plugin saves cookies and localStorage to `~/.camofox/profiles/<hashed-userId>/` so authenticated sessions survive browser restarts. Active sessions are periodically checkpointed as a safety net for manual login flows that do not explicitly close the session. UserIds are hashed for directory names. Disable via `camofox.config.json` by removing `persistence` from the plugins array.
 
 ### Network access
 

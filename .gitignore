@@ -39,6 +39,9 @@ fly.toml
 # Camoufox cache
 .camoufox/
 
+# Local agent knowledge cache
+.brv/
+
 # Test artifacts
 test-results/
 playwright-report/

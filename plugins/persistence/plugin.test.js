@@ -20,6 +20,7 @@ describe('persistence plugin', () => {
   });
 
   afterEach(async () => {
+    if (events) await events.emitAsync('server:shutdown');
     if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true });
   });
 
@@ -83,13 +84,33 @@ describe('persistence plugin', () => {
     expect(mockContext.storageState).toHaveBeenCalled();
   });
 
+  test('periodically checkpoints active sessions', async () => {
+    await register(mockApp, ctx, { profileDir: tmpDir, saveIntervalMs: 20 });
+
+    const mockContext = {
+      storageState: jest.fn(async ({ path: p }) => {
+        await fs.writeFile(p, JSON.stringify({ cookies: [], origins: [] }));
+      }),
+    };
+
+    await events.emitAsync('session:created', { userId: 'periodic-user', context: mockContext });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await events.emitAsync('server:shutdown');
+
+    expect(mockContext.storageState).toHaveBeenCalled();
+    const periodicLog = ctx.log.mock.calls.find(
+      ([level, message, fields]) => level === 'info' && message === 'storage state persisted' && fields.reason === 'periodic'
+    );
+    expect(periodicLog).toBeTruthy();
+  });
+
   test('env var CAMOFOX_PROFILE_DIR overrides pluginConfig', async () => {
     const envDir = path.join(tmpDir, 'env-override');
     const orig = process.env.CAMOFOX_PROFILE_DIR;
     process.env.CAMOFOX_PROFILE_DIR = envDir;
     try {
       await register(mockApp, ctx, { profileDir: '/should/not/use' });
-      expect(ctx.log).toHaveBeenCalledWith('info', 'persistence plugin enabled', { profileDir: envDir });
+      expect(ctx.log).toHaveBeenCalledWith('info', 'persistence plugin enabled', { profileDir: envDir, saveIntervalMs: 30000 });
     } finally {
       if (orig === undefined) delete process.env.CAMOFOX_PROFILE_DIR;
       else process.env.CAMOFOX_PROFILE_DIR = orig;

@@ -216,6 +216,42 @@ function createTestApp() {
     `);
   });
 
+  // Pages for browser storage persistence tests. They intentionally use both
+  // cookie and localStorage state because authenticated sites commonly rely on
+  // more than just cookies.
+  app.get('/persist-set', (req, res) => {
+    const value = String(req.query.value || 'missing').replace(/[<&>"']/g, '');
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Persistence Setter</title></head>
+      <body>
+        <h1>Persistence Setter</h1>
+        <p id="saved">Saved: ${value}</p>
+        <script>
+          document.cookie = 'camofox_persist=${value}; path=/; SameSite=Lax';
+          localStorage.setItem('camofox_persist', '${value}');
+        </script>
+      </body></html>
+    `);
+  });
+
+  app.get('/persist-check', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Persistence Check</title></head>
+      <body>
+        <h1>Persistence Check</h1>
+        <p id="cookie">Cookie: pending</p>
+        <p id="localStorage">LocalStorage: pending</p>
+        <script>
+          const cookieMatch = document.cookie.match(/(?:^|; )camofox_persist=([^;]+)/);
+          document.getElementById('cookie').textContent = 'Cookie: ' + (cookieMatch ? decodeURIComponent(cookieMatch[1]) : 'missing');
+          document.getElementById('localStorage').textContent = 'LocalStorage: ' + (localStorage.getItem('camofox_persist') || 'missing');
+        </script>
+      </body></html>
+    `);
+  });
+
   // Page and endpoint for download capture tests
   app.get('/download-page', (req, res) => {
     res.send(`
